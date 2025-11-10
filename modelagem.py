@@ -3,12 +3,10 @@ import plotly.figure_factory as ff
 import streamlit as st
 import numpy as np
 import pandas as pd
-
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis, QuadraticDiscriminantAnalysis
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.naive_bayes import MultinomialNB
-
 from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
 from sklearn.metrics import accuracy_score, recall_score, confusion_matrix
 
@@ -176,6 +174,42 @@ with tab_lda:
     proj_df = pd.DataFrame({"LD1": lda_proj[:, 0], "LD2": ld2, "glass_group": y.values})
     fig = px.scatter(proj_df, x="LD1", y="LD2", color="glass_group", title="LDA Projection (LD1 × LD2)")
     st.plotly_chart(fig)
+
+    # -------------------------------------------
+    # Redução de posto para classificação (LD1 × LD2)
+    # -------------------------------------------
+    st.subheader("Classificação por Redução de Posto — LD1 × LD2")
+
+    # Transformação LDA (rank máximo = C−1 = 2, pois temos 3 classes)
+    lda_proj_full = lda_final.transform(X_train_std)
+
+    # Sempre teremos apenas 2 dimensões neste caso
+    proj_train_df = pd.DataFrame({
+        "LD1": lda_proj_full[:, 0],
+        "LD2": lda_proj_full[:, 1],
+        "glass_group": y_train.values
+    })
+
+
+
+    # Classificação do conjunto de teste projetado
+    lda_proj_test = lda_final.transform(X_test_std)
+    proj_test_df = pd.DataFrame({
+        "LD1": lda_proj_test[:, 0],
+        "LD2": lda_proj_test[:, 1],
+        "Predito": y_pred_lda_test,
+        "Real": y_test.values
+    })
+
+    fig_test_rank = px.scatter(
+        proj_test_df,
+        x="LD1",
+        y="LD2",
+        color="Predito",
+        symbol="Real",
+        title="Classificação do Conjunto de Teste no Espaço LD1 × LD2"
+    )
+    st.plotly_chart(fig_test_rank)
 
 # ----------------------------
 # ABA QDA
