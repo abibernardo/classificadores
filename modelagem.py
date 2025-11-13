@@ -11,6 +11,7 @@ from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val
 from sklearn.metrics import accuracy_score, recall_score, confusion_matrix
 from sklearn.metrics import roc_auc_score
 from lightgbm import LGBMClassifier
+import lightgbm as lgb
 # ----------------------------
 # Funções utilitárias
 # ----------------------------
@@ -72,6 +73,50 @@ def cross_validate_model(model, X_data, y_series, cv):
 
     return accs, sens_list, esp_list, auc_roc_list
 
+def cross_validate_model_lgbm(model, X_data, y_series, cv, es_rounds=50, eval_metric=None):
+    """Retorna listas (accs, sens, esp, auc_roc) por fold, usando early stopping no LightGBM."""
+    accs, sens_list, esp_list, auc_roc_list = [], [], [], []
+
+    # métrica padrão: AUC p/ binário; multi_logloss p/ multiclasse
+    n_classes = np.unique(y_series).size
+    metric = eval_metric or ("auc" if n_classes == 2 else "multi_logloss")
+
+    for train_idx, val_idx in cv.split(X_data, y_series):
+        X_tr, X_val = X_data[train_idx], X_data[val_idx]
+        y_tr, y_val = y_series.iloc[train_idx], y_series.iloc[val_idx]
+
+        # fit com early stopping
+        model.fit(
+            X_tr, y_tr,
+            eval_set=[(X_val, y_val)],
+            eval_metric=metric,
+            callbacks=[lgb.early_stopping(stopping_rounds=es_rounds, verbose=False)]
+        )
+
+        # usa melhor iteração quando disponível
+        if getattr(model, "best_iteration_", None) is not None:
+            pred = model.predict(X_val, num_iteration=model.best_iteration_)
+        else:
+            pred = model.predict(X_val)
+
+        accs.append(accuracy_score(y_val, pred))
+        s, e = sens_esp(y_val, pred, labels_sorted)
+
+        # AUC-ROC (binário ou multiclasse OVR), usando best_iteration_ se houver
+        try:
+            if getattr(model, "best_iteration_", None) is not None:
+                proba = model.predict_proba(X_val, num_iteration=model.best_iteration_)
+            else:
+                proba = model.predict_proba(X_val)
+            auc_roc = roc_auc_score(y_val, proba, multi_class='ovr', average='macro')
+        except (ValueError, RuntimeWarning):
+            auc_roc = np.nan
+
+        sens_list.append(s)
+        esp_list.append(e)
+        auc_roc_list.append(auc_roc)
+
+    return accs, sens_list, esp_list, auc_roc_list
 # ----------------------------
 # Carregar dados
 # ----------------------------
@@ -144,7 +189,7 @@ with st.spinner("Executando validação cruzada para LightGBM (pode levar alguns
         learning_rate=0.1,
         colsample_bytree=0.8
     )
-    lgbm_acc, lgbm_sens, lgbm_esp, lgbm_auc = cross_validate_model(lgbm_model, X_train_std, y_train, cv)
+    lgbm_acc, lgbm_sens, lgbm_esp, lgbm_auc = cross_validate_model_lgbm(lgbm_model, X_train_std, y_train, cv)
 
 # ----------------------------
 # Abas por modelo
@@ -157,10 +202,33 @@ tab_df, tab_lda, tab_qda, tab_nb, tab_knn, tab_lgbm, tab_comp = st.tabs([
 # ABA APRESENTAÇÃO
 # ----------------------------
 with tab_df:
-    st.write("O objetivo deste estudo é comparar diferentes modelos para a classificação de tipos de vidro. São 10 variáveis explicativas contínuas, e uma variável resposta com 3 categorias.")
+    intro_md = """
+    O objetivo deste estudo é comparar diferentes modelos para a classificação de tipos de vidro. O dataset usado foi criado pelo USA Forensic Science Service e usado para estudar uma possível classificação de diferentes tipos de vidro baseando-se principalmente em sua composição química. A motivação para isso seria possibilitar essa classificação em investigações criminalistas — em cenas de crimes, por exemplo — quando fragmentos de vidro são coletados e é desejável inferir a que tipo de peça eles pertencem.
+
+    A base contém 214 observações. Utilizamos 9 variáveis explicativas contínuas: o índice de refração (RI) e a porcentagem em peso de oito óxidos principais (Na, Mg, Al, Si, K, Ca, Ba e Fe). A variável resposta original é `glass_type`, com **7 classes**:
+    1. `building_windows_float_processed` — *janelas de edifícios (processo float)*
+    2. `building_windows_non_float_processed` — *janelas de edifícios (processo não-float)*
+    3. `vehicle_windows_float_processed` — *janelas de veículos (processo float)*
+    4. `vehicle_windows_non_float_processed` — *janelas de veículos (processo não-float; ausente nesta base)*
+    5. `containers` — *recipientes*
+    6. `tableware` — *utensílios de mesa*
+    7. `headlamps` — *faróis (automotivos)*
+
+    O processo “float” é um método industrial de fabricação de chapas de vidro no qual o vidro fundido é derramado sobre uma camada de estanho líquido; esse processo é comum na fabricação de vidros de janela.
+
+    Para aumentar o número de amostras por classe e tornar a avaliação dos modelos mais estável, combinamos categorias afins da variável original em três grupos (`glass_group`). O mapeamento é:
+    - **Classe 1 →** {1, 3}  (*janelas — processo float*)  (87 observações)
+    - **Classe 2 →** {2, 4}  (*janelas — processo não-float; a classe 4 não aparece nesta base*) (76 observações)
+    - **Classe 3 →** {5, 6, 7}  (*vidros não-janela: recipientes, utensílios de mesa e faróis*) (51 observações)
+    """
+    st.markdown(intro_md)
+
+    st.subheader("Apresentação do Dataset")
     st.divider()
     st.dataframe(df)
-    fig = px.bar(df, x='glass_group')
+
+    st.subheader("Distribuição das Classes")
+    fig = px.histogram(df, x='glass_group', histnorm='percent', color='glass_type')
     st.plotly_chart(fig)
 # ----------------------------
 # ABA LDA
