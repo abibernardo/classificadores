@@ -7,9 +7,10 @@ from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis, QuadraticDiscriminantAnalysis
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.naive_bayes import MultinomialNB
-from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score, GridSearchCV
 from sklearn.metrics import accuracy_score, recall_score, confusion_matrix
-
+from sklearn.metrics import roc_auc_score
+from lightgbm import LGBMClassifier
 # ----------------------------
 # Funções utilitárias
 # ----------------------------
@@ -32,7 +33,6 @@ def sens_esp(y_true, y_pred, labels):
 
     return sens, np.mean(especificidades)
 
-
 def plot_confusion(cm, labels, title):
     """Plotly heatmap para matriz de confusão"""
     fig = ff.create_annotated_heatmap(
@@ -47,8 +47,8 @@ def plot_confusion(cm, labels, title):
 
 
 def cross_validate_model(model, X_data, y_series, cv):
-    """Retorna listas (accs, sens, esp) por fold para um dado modelo e dados."""
-    accs, sens_list, esp_list = [], [], []
+    """Retorna listas (accs, sens, esp, auc_roc) por fold para um dado modelo e dados."""
+    accs, sens_list, esp_list, auc_roc_list = [], [], [], []
     for train_idx, val_idx in cv.split(X_data, y_series):
         X_tr, X_val = X_data[train_idx], X_data[val_idx]
         y_tr, y_val = y_series.iloc[train_idx], y_series.iloc[val_idx]
@@ -58,15 +58,24 @@ def cross_validate_model(model, X_data, y_series, cv):
 
         accs.append(accuracy_score(y_val, pred))
         s, e = sens_esp(y_val, pred, labels_sorted)
+
+        # Try to calculate AUC-ROC, handle NaN/infinite values gracefully
+        try:
+            proba = model.predict_proba(X_val)
+            auc_roc = roc_auc_score(y_val, proba, multi_class='ovr', average='macro')
+        except (ValueError, RuntimeWarning):
+            auc_roc = np.nan  # Can't calculate AUC-ROC for this fold
+
         sens_list.append(s)
         esp_list.append(e)
+        auc_roc_list.append(auc_roc)
 
-    return accs, sens_list, esp_list
+    return accs, sens_list, esp_list, auc_roc_list
 
 # ----------------------------
 # Carregar dados
 # ----------------------------
-st.title("Modelos de Classificação: LDA, QDA, Naive Bayes Multinomial e KNN")
+st.title("Modelos de Classificação: LDA, QDA, Naive Bayes Multinomial, KNN e LightGBM")
 
 
 caminho = "https://raw.githubusercontent.com/abibernardo/repositorio/main/dataset_vidro_me906.csv"
@@ -77,7 +86,7 @@ df = df.loc[:, ~df.columns.str.contains("^Unnamed")]
 # ----------------------------
 # Pré-processamento
 # ----------------------------
-X = df.drop(columns=["glass_group"])
+X = df.drop(columns=["glass_group", "glass_type"])
 y = df["glass_group"].astype(str)  # garantir string
 labels_sorted = np.sort(np.unique(y))
 
@@ -106,21 +115,49 @@ cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 with st.spinner("Executando validação cruzada para LDA, QDA e Naive Bayes (pode levar alguns segundos)..."):
     # LDA
     lda_model = LinearDiscriminantAnalysis()
-    lda_acc, lda_sens, lda_esp = cross_validate_model(lda_model, X_train_std, y_train, cv)
+    lda_acc, lda_sens, lda_esp, lda_auc = cross_validate_model(lda_model, X_train_std, y_train, cv)
 
     # QDA
     qda_model = QuadraticDiscriminantAnalysis()
-    qda_acc, qda_sens, qda_esp = cross_validate_model(qda_model, X_train_std, y_train, cv)
+    qda_acc, qda_sens, qda_esp, qda_auc = cross_validate_model(qda_model, X_train_std, y_train, cv)
 
     # Multinomial NB (usa X_train_nb)
     nb_model = MultinomialNB()
-    nb_acc, nb_sens, nb_esp = cross_validate_model(nb_model, X_train_nb, y_train_nb, cv)
+    nb_acc, nb_sens, nb_esp, nb_auc = cross_validate_model(nb_model, X_train_nb, y_train_nb, cv)
+
+# LightGBM com GridSearchCV
+with st.spinner("Executando GridSearchCV para LightGBM (pode levar alguns minutos)..."):
+    # Define parameter grid
+    param_grid_lgbm = {
+        'n_estimators': [100, 300, 500],
+        'learning_rate': [0.01, 0.05, 0.1],
+        'max_depth': [3, 5, 7],
+        'num_leaves': [31, 50]
+    }
+
+    lgbm_base = LGBMClassifier(random_state=42, n_jobs=-1, verbose=-1)
+
+    grid_search_lgbm = GridSearchCV(
+        estimator=lgbm_base,
+        param_grid=param_grid_lgbm,
+        cv=cv,
+        scoring='accuracy',
+        verbose=0,
+        n_jobs=-1,
+        return_train_score=True
+    )
+
+    grid_search_lgbm.fit(X_train_std, y_train)
+
+    # Get CV results for best model by manually running cross_validate_model
+    best_lgbm = grid_search_lgbm.best_estimator_
+    lgbm_acc, lgbm_sens, lgbm_esp, lgbm_auc = cross_validate_model(best_lgbm, X_train_std, y_train, cv)
 
 # ----------------------------
 # Abas por modelo
 # ----------------------------
-tab_df, tab_lda, tab_qda, tab_nb, tab_knn, tab_comp = st.tabs([
-    "Apresentação do Dataset", "LDA", "QDA", "Naive Bayes Multinomial", "KNN", "Comparação"
+tab_df, tab_lda, tab_qda, tab_nb, tab_knn, tab_lgbm, tab_comp = st.tabs([
+    "Apresentação do Dataset", "LDA", "QDA", "Naive Bayes Multinomial", "KNN", "LightGBM", "Comparação"
 ])
 
 # ----------------------------
@@ -143,13 +180,15 @@ with tab_lda:
         "Fold": list(range(1, len(lda_acc) + 1)),
         "Accuracy": lda_acc,
         "Sensitivity (macro)": lda_sens,
-        "Specificity (macro)": lda_esp
+        "Specificity (macro)": lda_esp,
+        "AUC-ROC (macro)": lda_auc
     })
     st.dataframe(lda_df)
     st.subheader("Média dos Folds")
     st.metric(label="Acurácia média (treinamento)", value=f"{np.mean(lda_acc):.3f}")
     st.metric(label="Sensibilidade", value=f"{np.mean(lda_sens):.3f}")
     st.metric(label="Especificidade", value=f"{np.mean(lda_esp):.3f}")
+    st.metric(label="AUC-ROC", value=f"{np.nanmean(lda_auc):.3f}")
 
     # Ajuste final no treino completo e avaliação no teste
     lda_final = LinearDiscriminantAnalysis()
@@ -158,9 +197,18 @@ with tab_lda:
 
     st.subheader("Avaliação no conjunto de teste — LDA")
     sens_t, esp_t = sens_esp(y_test, y_pred_lda_test, labels_sorted)
+
+    # Try to calculate AUC-ROC for test set
+    try:
+        proba_lda_test = lda_final.predict_proba(X_test_std)
+        auc_lda_test = roc_auc_score(y_test, proba_lda_test, multi_class='ovr', average='macro')
+    except (ValueError, RuntimeWarning):
+        auc_lda_test = np.nan
+
     st.metric(label="Acurácia", value=f"{accuracy_score(y_test, y_pred_lda_test):.3f}")
     st.metric(label="Sensibilidade", value=f"{np.mean(sens_t):.3f}")
     st.metric(label="Especificidade", value=f"{np.mean(esp_t):.3f}")
+    st.metric(label="AUC-ROC", value=f"{auc_lda_test:.3f}" if not np.isnan(auc_lda_test) else "N/A")
 
     # Confusion matrix (test)
     cm_lda = confusion_matrix(y_test, y_pred_lda_test, labels=labels_sorted)
@@ -222,13 +270,15 @@ with tab_qda:
         "Fold": list(range(1, len(qda_acc) + 1)),
         "Accuracy": qda_acc,
         "Sensitivity (macro)": qda_sens,
-        "Specificity (macro)": qda_esp
+        "Specificity (macro)": qda_esp,
+        "AUC-ROC (macro)": qda_auc
     })
     st.dataframe(qda_df)
     st.subheader("Média dos Folds")
     st.metric(label="Acurácia média (treinamento)", value=f"{np.mean(qda_acc):.3f}")
     st.metric(label="Sensibilidade", value=f"{np.mean(qda_sens):.3f}")
     st.metric(label="Especificidade", value=f"{np.mean(qda_esp):.3f}")
+    st.metric(label="AUC-ROC", value=f"{np.nanmean(qda_auc):.3f}")
 
     # Ajuste final e avaliação no teste
     qda_final = QuadraticDiscriminantAnalysis()
@@ -237,9 +287,18 @@ with tab_qda:
 
     st.subheader("Avaliação no conjunto de teste — QDA")
     sens_t, esp_t = sens_esp(y_test, y_pred_qda_test, labels_sorted)
+
+    # Try to calculate AUC-ROC for test set
+    try:
+        proba_qda_test = qda_final.predict_proba(X_test_std)
+        auc_qda_test = roc_auc_score(y_test, proba_qda_test, multi_class='ovr', average='macro')
+    except (ValueError, RuntimeWarning):
+        auc_qda_test = np.nan
+
     st.metric(label="Acurácia", value=f"{accuracy_score(y_test, y_pred_qda_test):.3f}")
     st.metric(label="Sensibilidade", value=f"{np.mean(sens_t):.3f}")
     st.metric(label="Especificidade", value=f"{np.mean(esp_t):.3f}")
+    st.metric(label="AUC-ROC", value=f"{auc_qda_test:.3f}" if not np.isnan(auc_qda_test) else "N/A")
 
     # Confusion matrix (test)
     cm_qda = confusion_matrix(y_test, y_pred_qda_test, labels=labels_sorted)
@@ -258,13 +317,15 @@ with tab_nb:
         "Fold": list(range(1, len(nb_acc) + 1)),
         "Accuracy": nb_acc,
         "Sensitivity (macro)": nb_sens,
-        "Specificity (macro)": nb_esp
+        "Specificity (macro)": nb_esp,
+        "AUC-ROC (macro)": nb_auc
     })
     st.dataframe(nb_df)
     st.subheader("Média dos Folds")
     st.metric(label="Acurácia média (treinamento)", value=f"{np.mean(nb_acc):.3f}")
     st.metric(label="Sensibilidade", value=f"{np.mean(nb_sens):.3f}")
     st.metric(label="Especificidade", value=f"{np.mean(nb_esp):.3f}")
+    st.metric(label="AUC-ROC", value=f"{np.nanmean(nb_auc):.3f}")
 
     # Ajuste final e avaliação no teste (NB usa X_nb)
     nb_final = MultinomialNB()
@@ -273,9 +334,18 @@ with tab_nb:
 
     st.subheader("Avaliação no conjunto de teste — Multinomial NB")
     sens_t, esp_t = sens_esp(y_test_nb, y_pred_nb_test, labels_sorted)
+
+    # Try to calculate AUC-ROC for test set
+    try:
+        proba_nb_test = nb_final.predict_proba(X_test_nb)
+        auc_nb_test = roc_auc_score(y_test_nb, proba_nb_test, multi_class='ovr', average='macro')
+    except (ValueError, RuntimeWarning):
+        auc_nb_test = np.nan
+
     st.metric(label="Acurácia", value=f"{accuracy_score(y_test_nb, y_pred_nb_test):.3f}")
     st.metric(label="Sensibilidade", value=f"{np.mean(sens_t):.3f}")
     st.metric(label="Especificidade", value=f"{np.mean(esp_t):.3f}")
+    st.metric(label="AUC-ROC", value=f"{auc_nb_test:.3f}" if not np.isnan(auc_nb_test) else "N/A")
 
     cm_nb = confusion_matrix(y_test_nb, y_pred_nb_test, labels=labels_sorted)
     st.plotly_chart(plot_confusion(cm_nb, labels_sorted, "Confusion Matrix — Multinomial NB (test)"))
@@ -291,19 +361,21 @@ with tab_knn:
 
     st.subheader("Validação Cruzada (5 folds) — KNN")
     knn_model = KNeighborsClassifier(n_neighbors=k)
-    knn_acc, knn_sens, knn_esp = cross_validate_model(knn_model, X_train_std, y_train, cv)
+    knn_acc, knn_sens, knn_esp, knn_auc = cross_validate_model(knn_model, X_train_std, y_train, cv)
 
     knn_df = pd.DataFrame({
         "Fold": list(range(1, len(knn_acc) + 1)),
         "Accuracy": knn_acc,
         "Sensitivity (macro)": knn_sens,
-        "Specificity (macro)": knn_esp
+        "Specificity (macro)": knn_esp,
+        "AUC-ROC (macro)": knn_auc
     })
     st.dataframe(knn_df)
     st.subheader("Média dos Folds")
     st.metric(label="Acurácia média (treinamento)", value=f"{np.mean(knn_acc):.3f}")
     st.metric(label="Sensibilidade", value=f"{np.mean(knn_sens):.3f}")
     st.metric(label="Especificidade", value=f"{np.mean(knn_esp):.3f}")
+    st.metric(label="AUC-ROC", value=f"{np.nanmean(knn_auc):.3f}")
 
     # Ajuste final KNN e avaliação no teste
     knn_final = KNeighborsClassifier(n_neighbors=k)
@@ -312,9 +384,18 @@ with tab_knn:
 
     st.subheader("Avaliação no conjunto de teste — KNN")
     sens_t, esp_t = sens_esp(y_test, y_pred_knn_test, labels_sorted)
+
+    # Try to calculate AUC-ROC for test set
+    try:
+        proba_knn_test = knn_final.predict_proba(X_test_std)
+        auc_knn_test = roc_auc_score(y_test, proba_knn_test, multi_class='ovr', average='macro')
+    except (ValueError, RuntimeWarning):
+        auc_knn_test = np.nan
+
     st.metric(label="Acurácia", value=f"{accuracy_score(y_test, y_pred_knn_test):.3f}")
     st.metric(label="Sensibilidade", value=f"{np.mean(sens_t):.3f}")
     st.metric(label="Especificidade", value=f"{np.mean(esp_t):.3f}")
+    st.metric(label="AUC-ROC", value=f"{auc_knn_test:.3f}" if not np.isnan(auc_knn_test) else "N/A")
 
 
     cm_knn = confusion_matrix(y_test, y_pred_knn_test, labels=labels_sorted)
@@ -339,30 +420,116 @@ with tab_knn:
     st.write(f"Melhor k (CV 1..20): {best_k} — acurácia média: {df_ks['CV_accuracy'].max():.3f}")
 
 # ----------------------------
+# ABA LightGBM
+# ----------------------------
+with tab_lgbm:
+    st.header("LightGBM with GridSearchCV")
+
+    st.subheader("Melhores Parâmetros Encontrados")
+    best_params_df = pd.DataFrame({
+        "Parâmetro": list(grid_search_lgbm.best_params_.keys()),
+        "Valor": list(grid_search_lgbm.best_params_.values())
+    })
+    st.dataframe(best_params_df)
+
+    st.subheader("Validação Cruzada (5 folds) — LightGBM")
+    lgbm_df = pd.DataFrame({
+        "Fold": list(range(1, len(lgbm_acc) + 1)),
+        "Accuracy": lgbm_acc,
+        "Sensitivity (macro)": lgbm_sens,
+        "Specificity (macro)": lgbm_esp,
+        "AUC-ROC (macro)": lgbm_auc
+    })
+    st.dataframe(lgbm_df)
+
+    st.subheader("Média dos Folds")
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric(label="Acurácia média (treinamento)", value=f"{np.mean(lgbm_acc):.3f}")
+    with col2:
+        st.metric(label="Sensibilidade", value=f"{np.mean(lgbm_sens):.3f}")
+    with col3:
+        st.metric(label="Especificidade", value=f"{np.mean(lgbm_esp):.3f}")
+    with col4:
+        st.metric(label="AUC-ROC", value=f"{np.nanmean(lgbm_auc):.3f}")
+
+    # Ajuste final e avaliação no teste
+    lgbm_final = grid_search_lgbm.best_estimator_
+    lgbm_final.fit(X_train_std, y_train)
+    y_pred_lgbm_test = lgbm_final.predict(X_test_std)
+
+    st.subheader("Avaliação no conjunto de teste — LightGBM")
+    sens_t, esp_t = sens_esp(y_test, y_pred_lgbm_test, labels_sorted)
+
+    # Try to calculate AUC-ROC for test set
+    try:
+        proba_lgbm_test = lgbm_final.predict_proba(X_test_std)
+        auc_lgbm_test = roc_auc_score(y_test, proba_lgbm_test, multi_class='ovr', average='macro')
+    except (ValueError, RuntimeWarning):
+        auc_lgbm_test = np.nan
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric(label="Acurácia", value=f"{accuracy_score(y_test, y_pred_lgbm_test):.3f}")
+    with col2:
+        st.metric(label="Sensibilidade", value=f"{np.mean(sens_t):.3f}")
+    with col3:
+        st.metric(label="Especificidade", value=f"{np.mean(esp_t):.3f}")
+    with col4:
+        st.metric(label="AUC-ROC", value=f"{auc_lgbm_test:.3f}" if not np.isnan(auc_lgbm_test) else "N/A")
+
+    # Confusion matrix (test)
+    cm_lgbm = confusion_matrix(y_test, y_pred_lgbm_test, labels=labels_sorted)
+    st.plotly_chart(plot_confusion(cm_lgbm, labels_sorted, "Confusion Matrix — LightGBM (test)"))
+
+    # Grid Search results overview
+    st.subheader("Top 5 Combinações de Parâmetros (GridSearchCV)")
+    results_df = pd.DataFrame(grid_search_lgbm.cv_results_)
+    top_5 = results_df.nlargest(5, 'mean_test_score')[['params', 'mean_test_score', 'std_test_score', 'rank_test_score']]
+
+    for idx, row in top_5.iterrows():
+        with st.expander(f"Rank {int(row['rank_test_score'])}: Accuracy = {row['mean_test_score']:.4f} (+/- {row['std_test_score']:.4f})"):
+            params_display = pd.DataFrame({
+                "Parâmetro": list(row['params'].keys()),
+                "Valor": list(row['params'].values())
+            })
+            st.dataframe(params_display)
+
+# ----------------------------
 # ABA Comparação
 # ----------------------------
 with tab_comp:
     st.header("Comparação Geral")
 
     comp_df = pd.DataFrame({
-        "Modelo": ["LDA", "QDA", "KNN (selected k)", "Naive Bayes"],
+        "Modelo": ["LDA", "QDA", "KNN (selected k)", "Naive Bayes", "LightGBM"],
         "Acurácia (CV mean)": [
             np.mean(lda_acc),
             np.mean(qda_acc),
             np.mean(knn_acc),
-            np.mean(nb_acc)
+            np.mean(nb_acc),
+            np.mean(lgbm_acc)
         ],
         "Sensibilidade (CV mean)": [
             np.mean(lda_sens),
             np.mean(qda_sens),
             np.mean(knn_sens),
-            np.mean(nb_sens)
+            np.mean(nb_sens),
+            np.mean(lgbm_sens)
         ],
         "Especificidade (CV mean)": [
             np.mean(lda_esp),
             np.mean(qda_esp),
             np.mean(knn_esp),
-            np.mean(nb_esp)
+            np.mean(nb_esp),
+            np.mean(lgbm_esp)
+        ],
+        "AUC-ROC (CV mean)": [
+            np.nanmean(lda_auc),
+            np.nanmean(qda_auc),
+            np.nanmean(knn_auc),
+            np.nanmean(nb_auc),
+            np.nanmean(lgbm_auc)
         ]
     })
     st.dataframe(comp_df)
@@ -370,13 +537,9 @@ with tab_comp:
     st.subheader("Boxplot comparativo (todas as métricas por fold)")
     # reorganizar cv_df para plot (usar os arrays já calculados)
     cv_comp_df = pd.DataFrame({
-        "Fold": list(range(1, len(lda_acc) + 1)) * 4,
-        "Modelo": ["LDA"] * len(lda_acc) + ["QDA"] * len(qda_acc) + ["KNN"] * len(knn_acc) + ["NB"] * len(nb_acc),
-        "Accuracy": lda_acc + qda_acc + knn_acc + nb_acc
+        "Fold": list(range(1, len(lda_acc) + 1)) * 5,
+        "Modelo": ["LDA"] * len(lda_acc) + ["QDA"] * len(qda_acc) + ["KNN"] * len(knn_acc) + ["NB"] * len(nb_acc) + ["LightGBM"] * len(lgbm_acc),
+        "Accuracy": lda_acc + qda_acc + knn_acc + nb_acc + lgbm_acc
     })
     fig_box = px.box(cv_comp_df, x="Modelo", y="Accuracy", title="Distribuição das Acurácias (CV) — Modelos")
     st.plotly_chart(fig_box)
-
-
-
-
